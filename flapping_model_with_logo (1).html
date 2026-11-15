@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Flapping Model Viewer</title>
+    <!-- Load Three.js and OrbitControls -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: transparent !important;
+            background-color: transparent !important;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+            touch-action: none;
+            background: transparent !important;
+        }
+        canvas {
+            background: transparent !important;
+        }
+
+        /* Pure CSS 3D Fallback Container */
+        #css3d-fallback {
+            display: none;
+            width: 100vw;
+            height: 100vh;
+            align-items: center;
+            justify-content: center;
+            perspective: 1100px;
+            background: transparent !important;
+        }
+        #css3d-stage {
+            position: relative;
+            width: min(74vw, 450px);
+            height: min(74vh, 450px);
+            transform-style: preserve-3d;
+            will-change: transform;
+        }
+        .css-flap-layer {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            transform-origin: 50% 42%;
+            transform-style: preserve-3d;
+            will-change: transform;
+        }
+        .css-flap-layer img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            pointer-events: none;
+            display: block;
+        }
+
+        /* Masked White Holographic Scanner Beam for CSS Fallback */
+        .css-scan-overlay {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            -webkit-mask-image: var(--mask-url);
+            mask-image: var(--mask-url);
+            -webkit-mask-size: contain;
+            mask-size: contain;
+            -webkit-mask-repeat: no-repeat;
+            mask-repeat: no-repeat;
+            -webkit-mask-position: center;
+            mask-position: center;
+            background: linear-gradient(
+                180deg,
+                rgba(255, 255, 255, 0) 0%,
+                rgba(255, 255, 255, 0.25) 42%,
+                rgba(255, 255, 255, 0.95) 50%,
+                rgba(255, 255, 255, 0.35) 58%,
+                rgba(255, 255, 255, 0) 100%
+            );
+            background-size: 100% 240%;
+            mix-blend-mode: screen;
+            animation: cssWhiteScan 3.2s ease-in-out infinite;
+        }
+
+        @keyframes cssWhiteScan {
+            0% { background-position: 0% 130%; }
+            50% { background-position: 0% -30%; }
+            100% { background-position: 0% 130%; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Full-Screen WebGL Canvas Container -->
+    <div id="canvas-container"></div>
+
+    <!-- Guaranteed CSS 3D Fallback Container -->
+    <div id="css3d-fallback">
+        <div id="css3d-stage">
+            <div class="css-flap-layer" id="css-flap-body">
+                <img id="css-img-main" alt="" />
+                <div class="css-scan-overlay" id="css-scan-beam"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Exact Postimg Direct Image URL
+        const TARGET_IMAGE_URL = "https://raw.githubusercontent.com/charmieluzgapa07-hub/Picture/main/Logo.PNG";
+
+        // Multi-step CORS proxy URLs for smooth WebGL texture loading
+        const IMAGE_CANDIDATES = [
+            "https://corsproxy.io/?" + encodeURIComponent(TARGET_IMAGE_URL),
+            "https://api.allorigins.win/raw?url=" + encodeURIComponent(TARGET_IMAGE_URL),
+            "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(TARGET_IMAGE_URL),
+            TARGET_IMAGE_URL
+        ];
+
+        // Global Scene Variables
+        let scene, camera, renderer, controls, clock;
+        let modelGroup, frontMesh, backMesh;
+        let frontGeom, backGeom;
+        let frontBasePositions, backBasePositions;
+        let frontShaderMaterial, backShaderMaterial;
+
+        // Animation & Timeline State
+        let userInteracting = false;
+        let lastInteractionTime = 0;
+        let sequenceStartTime = 0;
+        let currentRotationY = 0;
+
+        // Timing Constants
+        const SINGLE_FLAP_DURATION = 3.0; 
+        const FRONT_STAY_DURATION = 30.0; 
+        const TOTAL_CYCLE_DURATION = SINGLE_FLAP_DURATION + FRONT_STAY_DURATION; 
+        const flapAmplitude = 0.45;
+        let meshWidth = 3.2;
+        let meshHeight = 3.5;
+        let webglReady = false;
+        let usingCssFallback = false;
+
+        const holographicVertexShader = `
+            varying vec2 vUv;
+            void main() {
+                vUv = uv;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+        `;
+
+        const holographicFragmentShader = `
+            uniform sampler2D uMap;
+            uniform float uTime;
+            uniform float uMirrorX;
+            varying vec2 vUv;
+
+            void main() {
+                vec2 sampleUv = vec2(uMirrorX > 0.5 ? (1.0 - vUv.x) : vUv.x, vUv.y);
+                vec4 texColor = texture2D(uMap, sampleUv);
+
+                if (texColor.a < 0.05) discard;
+
+                vec3 baseColor = texColor.rgb;
+                float scanCycle = sin(uTime * 1.95) * 0.5 + 0.5;
+                float distToScan = abs(vUv.y - scanCycle);
+
+                float whiteCore = smoothstep(0.032, 0.0, distToScan);
+                float scanHalo = smoothstep(0.14, 0.0, distToScan);
+
+                float microLines = sin(vUv.y * 180.0 - uTime * 12.0) * 0.5 + 0.5;
+                float scanIntensity = (whiteCore * 1.15) + (scanHalo * (0.32 + 0.14 * microLines));
+
+                vec3 scannerColor = vec3(1.0, 1.0, 1.0);
+                vec3 finalColor = baseColor + scannerColor * scanIntensity;
+
+                gl_FragColor = vec4(finalColor, texColor.a);
+            }
+        `;
+
+        function init() {
+            const container = document.getElementById('canvas-container');
+
+            scene = new THREE.Scene();
+
+            const width = window.innerWidth;
+            const height = window.innerHeight;
+            camera = new THREE.PerspectiveCamera(42, width / height, 0.1, 100);
+            camera.position.set(0, 0.05, 6.2);
+
+            renderer = new THREE.WebGLRenderer({
+                antialias: true,
+                alpha: true,
+                premultipliedAlpha: false,
+                powerPreference: "high-performance"
+            });
+            renderer.setSize(width, height);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.setClearColor(0x000000, 0);
+            container.appendChild(renderer.domElement);
+
+            const ambientLight = new THREE.AmbientLight(0xffffff, 1.0);
+            scene.add(ambientLight);
+
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.07;
+            controls.enablePan = false;
+            controls.minDistance = 2.8;
+            controls.maxDistance = 12.0;
+
+            controls.addEventListener('start', () => { userInteracting = true; });
+            controls.addEventListener('end', () => {
+                userInteracting = false;
+                lastInteractionTime = clock.getElapsedTime();
+            });
+
+            modelGroup = new THREE.Group();
+            scene.add(modelGroup);
+
+            clock = new THREE.Clock();
+            window.addEventListener('resize', onWindowResize, false);
+
+            loadTextureWithFallback(0);
+            animate();
+        }
+
+        function loadTextureWithFallback(index) {
+            if (index >= IMAGE_CANDIDATES.length) {
+                activateCss3dFallback();
+                return;
+            }
+
+            const loader = new THREE.TextureLoader();
+            loader.setCrossOrigin('anonymous');
+
+            loader.load(
+                IMAGE_CANDIDATES[index],
+                (texture) => {
+                    texture.minFilter = THREE.LinearFilter;
+                    texture.magFilter = THREE.LinearFilter;
+                    texture.needsUpdate = true;
+                    createModelFromTexture(texture);
+                },
+                undefined,
+                () => {
+                    loadTextureWithFallback(index + 1);
+                }
+            );
+        }
+
+        function createModelFromTexture(texture) {
+            const img = texture.image;
+            const aspect = (img && img.width && img.height) ? (img.width / img.height) : 0.9;
+
+            meshHeight = 3.5;
+            meshWidth = meshHeight * aspect;
+
+            const segX = 48;
+            const segY = 56;
+
+            frontGeom = new THREE.PlaneGeometry(meshWidth, meshHeight, segX, segY);
+            frontBasePositions = new Float32Array(frontGeom.attributes.position.array);
+
+            frontShaderMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    uMap: { value: texture },
+                    uTime: { value: 0.0 },
+                    uMirrorX: { value: 0.0 }
+                },
+                vertexShader: holographicVertexShader,
+                fragmentShader: holographicFragmentShader,
+                transparent: true,
+                side: THREE.FrontSide,
+                depthWrite: true
+            });
+
+            frontMesh = new THREE.Mesh(frontGeom, frontShaderMaterial);
+            frontMesh.position.z = 0.015;
+            modelGroup.add(frontMesh);
+
+            backGeom = new THREE.PlaneGeometry(meshWidth, meshHeight, segX, segY);
+            backBasePositions = new Float32Array(backGeom.attributes.position.array);
+
+            backShaderMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    uMap: { value: texture },
+                    uTime: { value: 0.0 },
+                    uMirrorX: { value: 1.0 }
+                },
+                vertexShader: holographicVertexShader,
+                fragmentShader: holographicFragmentShader,
+                transparent: true,
+                side: THREE.FrontSide,
+                depthWrite: true
+            });
+
+            backMesh = new THREE.Mesh(backGeom, backShaderMaterial);
+            backMesh.rotation.y = Math.PI;
+            backMesh.position.z = -0.015;
+            modelGroup.add(backMesh);
+
+            sequenceStartTime = clock.getElapsedTime();
+            webglReady = true;
+        }
+
+        function activateCss3dFallback() {
+            usingCssFallback = true;
+            document.getElementById('canvas-container').style.display = 'none';
+            const fallbackDiv = document.getElementById('css3d-fallback');
+            fallbackDiv.style.display = 'flex';
+
+            const imgEl = document.getElementById('css-img-main');
+            const scanEl = document.getElementById('css-scan-beam');
+            imgEl.src = TARGET_IMAGE_URL;
+            scanEl.style.setProperty('--mask-url', `url("${TARGET_IMAGE_URL}")`);
+
+            sequenceStartTime = clock.getElapsedTime();
+        }
+
+        function deformMeshVertices(geom, basePos, flapWave, phaseOffset, isBack) {
+            const posAttr = geom.attributes.position;
+            const arr = posAttr.array;
+
+            for (let i = 0; i < arr.length; i += 3) {
+                const bx = basePos[i];
+                const by = basePos[i + 1];
+                const bz = basePos[i + 2];
+
+                const normX = bx / (meshWidth * 0.5);
+                const normY = by / (meshHeight * 0.5);
+
+                const wingCurve = Math.pow(Math.abs(normX), 1.45) * flapWave * flapAmplitude;
+                const verticalBend = Math.sin(normY * Math.PI * 0.5) * flapWave * 0.14;
+                const zOffset = (wingCurve + verticalBend) * (isBack ? -1 : 1);
+
+                arr[i] = bx;
+                arr[i + 1] = by + Math.abs(flapWave) * 0.04;
+                arr[i + 2] = bz + zOffset + phaseOffset;
+            }
+            posAttr.needsUpdate = true;
+        }
+
+        function updateSingleFlapDeformation(progress, isFlapping) {
+            if (!webglReady || !frontGeom || !backGeom) return;
+            const flapWave = isFlapping ? Math.sin(progress * Math.PI * 2.0) * Math.sin(progress * Math.PI) : 0.0;
+            deformMeshVertices(frontGeom, frontBasePositions, flapWave, 0.015, false);
+            deformMeshVertices(backGeom, backBasePositions, flapWave, 0.015, true);
+        }
+
+        function easeInOutCubic(t) {
+            return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+        }
+
+        function updateSequenceState(elapsed) {
+            const cycleTime = (elapsed - sequenceStartTime) % TOTAL_CYCLE_DURATION;
+            const isFlapping = cycleTime < SINGLE_FLAP_DURATION;
+
+            let targetRotY = 0;
+            let flapProgress = 0;
+
+            if (isFlapping) {
+                flapProgress = cycleTime / SINGLE_FLAP_DURATION;
+                targetRotY = easeInOutCubic(flapProgress) * Math.PI * 2.0;
+            } else {
+                flapProgress = 0;
+                targetRotY = 0;
+            }
+
+            if (!userInteracting && (elapsed - lastInteractionTime > 1.5)) {
+                currentRotationY = targetRotY;
+            }
+
+            if (webglReady && modelGroup) {
+                modelGroup.rotation.y = currentRotationY;
+                modelGroup.position.y = Math.sin(elapsed * 1.8) * 0.035;
+                updateSingleFlapDeformation(flapProgress, isFlapping);
+            } else if (usingCssFallback) {
+                const stage = document.getElementById('css3d-stage');
+                const body = document.getElementById('css-flap-body');
+                if (stage && body) {
+                    const degY = (currentRotationY * 180) / Math.PI;
+                    const hoverY = Math.sin(elapsed * 1.8) * 6;
+                    const tiltX = isFlapping ? Math.sin(flapProgress * Math.PI * 2.0) * 14 : 0;
+                    stage.style.transform = `translateY(${hoverY}px) rotateY(${degY}deg)`;
+                    body.style.transform = `rotateX(${tiltX}deg)`;
+                }
+            }
+        }
+
+        function onWindowResize() {
+            if (!camera || !renderer) return;
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const elapsed = clock.getElapsedTime();
+
+            if (frontShaderMaterial) frontShaderMaterial.uniforms.uTime.value = elapsed;
+            if (backShaderMaterial) backShaderMaterial.uniforms.uTime.value = elapsed;
+
+            updateSequenceState(elapsed);
+
+            if (controls) controls.update();
+            if (renderer && scene && camera) {
+                renderer.render(scene, camera);
+            }
+        }
+
+        window.onload = init;
+    </script>
+</body>
+</html>
